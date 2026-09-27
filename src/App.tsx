@@ -20,6 +20,7 @@ import {
 type StepStatus = 'draft' | 'submitted' | 'confirmed' | 'returned';
 type ProcessStatus = 'draft' | 'in-review' | 'frozen' | 'revising';
 type ViewId = 'editor' | 'review' | 'compare';
+type CommentFieldKey = 'step' | 'title' | 'purpose' | 'materials' | 'equipment' | 'amount' | 'duration' | 'hazards' | 'controls' | 'safetyNote' | 'expectedResult' | 'dependencies';
 
 interface ReviewComment {
   id: string;
@@ -28,6 +29,12 @@ interface ReviewComment {
   text: string;
   createdAt: string;
   resolved: boolean;
+  /** 批注关联的字段；缺省（旧数据）按整步处理 */
+  fieldKey?: CommentFieldKey;
+  /** 写入批注时关联字段的值（序列化），用于检测后续变更 */
+  fieldValue?: string;
+  /** 因关联字段变更而自动退回待处理的时间 */
+  reopenedAt?: string;
 }
 
 interface ProcessStep {
@@ -102,7 +109,7 @@ function initialProcess(): ExperimentProcess {
       duration: 15, hazards: ['易燃液体'], controls: '在通风柜内取用，远离点火源；使用接地金属容器。',
       dependencies: [], safetyNote: '操作人员需佩戴护目镜和防化手套。', expectedResult: '试剂标签、数量和有效期均核对无误。',
       status: 'confirmed', comments: [
-        { id: 'c-1', author: '李明', role: '研究员', text: '已核对批号和有效期，防爆柜温度记录正常。', createdAt: '2026-09-24T09:10:00+08:00', resolved: true }
+        { id: 'c-1', author: '李明', role: '研究员', text: '已核对批号和有效期，防爆柜温度记录正常。', createdAt: '2026-09-24T09:10:00+08:00', resolved: true, fieldKey: 'materials', fieldValue: '无水乙醇、去离子水' }
       ]
     },
     {
@@ -111,7 +118,7 @@ function initialProcess(): ExperimentProcess {
       duration: 25, hazards: ['烫伤', '管路脱落'], controls: '管路双端固定；升温前完成 5 分钟试压并设置独立超温断电。',
       dependencies: ['step-1'], safetyNote: '高温表面设置警示标识，循环浴周围保持干燥。', expectedResult: '30 分钟内温度稳定在 55 ± 0.5 ℃。',
       status: 'confirmed', comments: [
-        { id: 'c-2', author: '王颖', role: '安全复核员', text: '补充超温断电值，不能只依赖设备自带温控。', createdAt: '2026-09-24T10:05:00+08:00', resolved: true }
+        { id: 'c-2', author: '王颖', role: '安全复核员', text: '补充超温断电值，不能只依赖设备自带温控。', createdAt: '2026-09-24T10:05:00+08:00', resolved: true, fieldKey: 'controls', fieldValue: '管路双端固定；升温前完成 5 分钟试压并设置独立超温断电。' }
       ]
     },
     {
@@ -194,7 +201,7 @@ function loadProcess(): ExperimentProcess {
     const value = localStorage.getItem(STORAGE_KEY);
     if (!value) return initialProcess();
     const parsed = JSON.parse(value) as ExperimentProcess;
-    return parsed.id && Array.isArray(parsed.steps) ? parsed : initialProcess();
+    return parsed.id && Array.isArray(parsed.steps) ? migrateProcess(parsed) : initialProcess();
   } catch {
     return initialProcess();
   }
@@ -202,6 +209,81 @@ function loadProcess(): ExperimentProcess {
 
 function splitList(value: string): string[] {
   return value.split(/[\n,，、;；]+/).map((item) => item.trim()).filter(Boolean);
+}
+
+const COMMENT_FIELD_OPTIONS: { value: CommentFieldKey; label: string }[] = [
+  { value: 'step', label: '整步' },
+  { value: 'title', label: '步骤名称' },
+  { value: 'purpose', label: '操作目的' },
+  { value: 'materials', label: '材料' },
+  { value: 'equipment', label: '设备' },
+  { value: 'amount', label: '用量 / 参数' },
+  { value: 'duration', label: '预计时间' },
+  { value: 'hazards', label: '危险项' },
+  { value: 'controls', label: '控制措施' },
+  { value: 'safetyNote', label: '安全说明' },
+  { value: 'expectedResult', label: '预期结果' },
+  { value: 'dependencies', label: '前置依赖' }
+];
+
+const TRACKED_STEP_FIELDS: (keyof ProcessStep)[] = ['title', 'purpose', 'materials', 'equipment', 'amount', 'duration', 'hazards', 'controls', 'safetyNote', 'expectedResult', 'dependencies'];
+
+function commentFieldLabel(key: CommentFieldKey | undefined): string {
+  return COMMENT_FIELD_OPTIONS.find((option) => option.value === (key ?? 'step'))?.label ?? '整步';
+}
+
+/** 序列化步骤某字段的当前值；'step' 表示整步内容摘要 */
+function commentFieldValue(step: ProcessStep, key: CommentFieldKey): string {
+  if (key === 'step') {
+    return JSON.stringify(TRACKED_STEP_FIELDS.map((field) => step[field]));
+  }
+  const value = step[key];
+  return Array.isArray(value) ? JSON.stringify(value) : String(value ?? '');
+}
+
+/** 把序列化的字段值转成可读文本，用于展示“写入时的值” */
+function displayFieldValue(raw: string | undefined): string {
+  if (raw === undefined || raw === '') return '（空）';
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (Array.isArray(parsed)) return parsed.join('、') || '（空）';
+  } catch {
+    // 非 JSON 的普通字符串直接展示
+  }
+  return raw;
+}
+
+/** 计算某次字段修改会让哪些已解决批注退回待处理 */
+function reopenedCommentsFor(step: ProcessStep, field: keyof ProcessStep, value: unknown): ReviewComment[] {
+  if (!TRACKED_STEP_FIELDS.includes(field)) return [];
+  const nextStep = { ...step, [field]: value } as ProcessStep;
+  return step.comments.filter((comment) => {
+    if (!comment.resolved || comment.fieldValue === undefined) return false;
+    const key = comment.fieldKey ?? 'step';
+    if (key !== 'step' && key !== field) return false;
+    return commentFieldValue(nextStep, key) !== comment.fieldValue;
+  });
+}
+
+/** 旧数据迁移：没有字段信息的批注按整步处理，以当前内容作为基线 */
+function migrateProcess(process: ExperimentProcess): ExperimentProcess {
+  const migrateSteps = (steps: ProcessStep[]): void => {
+    steps.forEach((step) => {
+      if (!Array.isArray(step.comments)) {
+        step.comments = [];
+        return;
+      }
+      step.comments.forEach((comment) => {
+        if (!comment.fieldKey) {
+          comment.fieldKey = 'step';
+          comment.fieldValue = commentFieldValue(step, 'step');
+        }
+      });
+    });
+  };
+  migrateSteps(process.steps);
+  process.versions?.forEach((version) => migrateSteps(version.steps));
+  return process;
 }
 
 function statusLabel(status: StepStatus): string {
@@ -226,6 +308,7 @@ function App() {
   const [activeView, setActiveView] = useState<ViewId>('editor');
   const [lastModifiedId, setLastModifiedId] = useState<string | null>(null);
   const [commentText, setCommentText] = useState('');
+  const [commentField, setCommentField] = useState<CommentFieldKey>('step');
   const [savedLabel, setSavedLabel] = useState('本地数据已载入');
   const [online, setOnline] = useState(true);
   const [compareBaseId, setCompareBaseId] = useState(process.versions[0]?.id ?? '');
@@ -240,6 +323,12 @@ function App() {
   const confirmedCount = process.steps.filter((step) => step.status === 'confirmed').length;
   const reviewProgress = process.steps.length ? Math.round((confirmedCount / process.steps.length) * 100) : 0;
   const versionDiff = useMemo(() => compareVersions(process, compareBaseId, compareTargetId), [process, compareBaseId, compareTargetId]);
+  const openComments = useMemo(
+    () => process.steps.flatMap((step) => step.comments.filter((comment) => !comment.resolved).map((comment) => ({ step, comment }))),
+    [process]
+  );
+  const selectedOpenComments = selectedStep ? selectedStep.comments.filter((comment) => !comment.resolved) : [];
+  const selectedReopenedCount = selectedOpenComments.filter((comment) => comment.reopenedAt).length;
 
   useEffect(() => {
     if (!initialSaveSkipped.current) {
@@ -293,10 +382,25 @@ function App() {
     if (!selectedStep) return;
     const id = selectedStep.id;
     setLastModifiedId(id);
+    const reopened = reopenedCommentsFor(selectedStep, field, value);
     commitProcess((draft) => {
       const step = draft.steps.find((item) => item.id === id);
-      if (step) (step as unknown as Record<string, unknown>)[field] = value;
+      if (!step) return;
+      (step as unknown as Record<string, unknown>)[field] = value;
+      if (reopened.length) {
+        const now = new Date().toISOString();
+        step.comments.forEach((comment) => {
+          if (reopened.some((item) => item.id === comment.id)) {
+            comment.resolved = false;
+            comment.reopenedAt = now;
+          }
+        });
+        if (step.status === 'confirmed') step.status = 'submitted';
+      }
     });
+    if (reopened.length) {
+      setSavedLabel(`${reopened.length} 条批注因「${commentFieldLabel(field as CommentFieldKey)}」变更退回待处理，步骤退回待复核`);
+    }
   };
 
   const updateStepList = (field: 'hazards' | 'dependencies', value: string): void => {
@@ -325,7 +429,8 @@ function App() {
     copy.id = uid('step');
     copy.title = `${copy.title}（副本）`;
     copy.status = 'draft';
-    copy.comments = [];
+    // 保留批注及其字段基线：复制时值相同不会误退回，之后再改对应字段仍会退回待处理
+    copy.comments = copy.comments.map((comment) => ({ ...comment, id: uid('comment') }));
     copy.dependencies = [...copy.dependencies];
     commitProcess((draft) => {
       const index = draft.steps.findIndex((step) => step.id === selectedStep.id);
@@ -380,11 +485,14 @@ function App() {
   const addReviewComment = (): void => {
     if (!selectedStep || !commentText.trim()) return;
     const id = selectedStep.id;
+    const fieldKey = commentField;
     commitProcess((draft) => {
       const step = draft.steps.find((item) => item.id === id);
-      step?.comments.push({
+      if (!step) return;
+      step.comments.push({
         id: uid('comment'), author: CURRENT_AUTHOR, role: CURRENT_ROLE,
-        text: commentText.trim(), createdAt: new Date().toISOString(), resolved: false
+        text: commentText.trim(), createdAt: new Date().toISOString(), resolved: false,
+        fieldKey, fieldValue: commentFieldValue(step, fieldKey)
       });
     });
     setCommentText('');
@@ -400,15 +508,26 @@ function App() {
     if (!selectedStep) return;
     const stepId = selectedStep.id;
     commitProcess((draft) => {
-      const comment = draft.steps.find((step) => step.id === stepId)?.comments.find((item) => item.id === commentId);
-      if (comment) comment.resolved = !comment.resolved;
+      const step = draft.steps.find((item) => item.id === stepId);
+      const comment = step?.comments.find((item) => item.id === commentId);
+      if (!step || !comment) return;
+      comment.resolved = !comment.resolved;
+      if (comment.resolved) {
+        // 重新处理完成时，以当前字段值作为新的基线
+        comment.fieldValue = commentFieldValue(step, comment.fieldKey ?? 'step');
+        comment.reopenedAt = undefined;
+      }
     });
   };
 
   const freezeVersion = (): void => {
     if (process.status === 'frozen') return;
-    if (process.steps.some((step) => step.status !== 'confirmed') || missingSafetySteps.length) {
-      setSavedLabel('冻结条件未满足');
+    if (process.steps.some((step) => step.status !== 'confirmed') || missingSafetySteps.length || openComments.length) {
+      const reasons: string[] = [];
+      if (process.steps.some((step) => step.status !== 'confirmed')) reasons.push('存在未确认步骤');
+      if (missingSafetySteps.length) reasons.push(`${missingSafetySteps.length} 条安全缺口`);
+      if (openComments.length) reasons.push(`${openComments.length} 条批注未重新处理`);
+      setSavedLabel(`冻结条件未满足：${reasons.join('、')}`);
       return;
     }
     const nextNumber = nextMinorVersion(process.version);
@@ -543,6 +662,13 @@ function App() {
                 <div><span>STEP {String(process.steps.indexOf(selectedStep) + 1).padStart(2, '0')}</span><h3>{selectedStep.title}</h3></div>
                 <Tag minimal intent={selectedStep.status === 'confirmed' ? 'success' : selectedStep.status === 'returned' ? 'danger' : 'warning'}>{statusLabel(selectedStep.status)}</Tag>
               </div>
+              {selectedOpenComments.length > 0 && (
+                <Callout intent="warning" icon="comment" className="step-comment-alert">
+                  该步骤有 {selectedOpenComments.length} 条复核批注待处理
+                  {selectedReopenedCount > 0 && `，其中 ${selectedReopenedCount} 条因关联字段变更自动退回`}
+                  ，请到「安全复核」页逐条重新处理。
+                </Callout>
+              )}
               <FormGroup label="步骤名称" labelFor="step-title"><InputGroup id="step-title" fill value={selectedStep.title} onChange={(event) => updateStep('title', event.target.value)} /></FormGroup>
               <FormGroup label="操作目的" labelFor="step-purpose"><TextArea id="step-purpose" fill value={selectedStep.purpose} onChange={(event) => updateStep('purpose', event.target.value)} /></FormGroup>
               <div className="form-grid">
@@ -605,6 +731,7 @@ function App() {
               <div className="card-title"><div><span>RELEASE GATE</span><h3>提交与冻结</h3></div></div>
               <div className="gate-row"><span>复核状态</span><strong>{confirmedCount}/{process.steps.length}</strong></div>
               <div className="gate-row"><span>安全缺口</span><strong className={missingSafetySteps.length ? 'danger-text' : ''}>{missingSafetySteps.length}</strong></div>
+              <div className="gate-row"><span>未处理批注</span><strong className={openComments.length ? 'danger-text' : ''}>{openComments.length}</strong></div>
               <div className="gate-row"><span>流程状态</span><strong>{processStatusLabel(process.status)}</strong></div>
               <Divider />
               {process.status === 'frozen' ? <Button fill intent="warning" icon="git-branch" text="从冻结版创建修订" onClick={startRevision} /> : <Button fill intent="primary" icon="send-to" text="提交复核" onClick={submitForReview} />}
@@ -617,11 +744,14 @@ function App() {
         <main className="review-layout">
           <aside className="review-steps">
             <div className="panel-heading"><div><span>REVIEW QUEUE</span><h3>逐条复核</h3></div><Tag intent={pendingReviewCount ? 'warning' : 'success'}>{pendingReviewCount ? `${pendingReviewCount} 待处理` : '已完成'}</Tag></div>
-            {process.steps.map((step, index) => (
-              <button key={step.id} className={`${step.id === selectedStep.id ? 'selected' : ''} ${step.status}`} onClick={() => setSelectedStepId(step.id)}>
-                <span>{String(index + 1).padStart(2, '0')}</span><div><strong>{step.title}</strong><small>{statusLabel(step.status)}</small></div><Icon icon={step.status === 'confirmed' ? 'tick-circle' : step.status === 'returned' ? 'undo' : 'circle'} size={15} />
-              </button>
-            ))}
+            {process.steps.map((step, index) => {
+              const openCount = step.comments.filter((comment) => !comment.resolved).length;
+              return (
+                <button key={step.id} className={`${step.id === selectedStep.id ? 'selected' : ''} ${step.status}`} onClick={() => setSelectedStepId(step.id)}>
+                  <span>{String(index + 1).padStart(2, '0')}</span><div><strong>{step.title}</strong><small>{statusLabel(step.status)}{openCount > 0 && ` · ${openCount} 条批注待处理`}</small></div><Icon icon={step.status === 'confirmed' ? 'tick-circle' : step.status === 'returned' ? 'undo' : 'circle'} size={15} />
+                </button>
+              );
+            })}
           </aside>
           <section className="review-main">
             {selectedStep && (
@@ -638,18 +768,43 @@ function App() {
                   {hasMissingSafety(selectedStep) && <Callout intent="danger" icon="warning-sign">当前步骤存在安全信息缺口，不能确认或冻结版本。</Callout>}
                 </Card>
                 <Card elevation={Elevation.ONE} className="comment-card">
-                  <div className="card-title"><div><span>REVIEW COMMENTS</span><h3>复核批注</h3></div><Tag minimal>{selectedStep.comments.length} 条</Tag></div>
+                  <div className="card-title"><div><span>REVIEW COMMENTS</span><h3>复核批注</h3></div><Tag minimal intent={selectedOpenComments.length ? 'warning' : 'none'}>{selectedStep.comments.length} 条{selectedOpenComments.length ? ` · ${selectedOpenComments.length} 待处理` : ''}</Tag></div>
                   <div className="comment-compose">
                     <TextArea fill value={commentText} onChange={(event) => setCommentText(event.target.value)} placeholder="填写具体依据、风险或修改建议…" />
-                    <Button intent="primary" icon="comment" text="添加批注" disabled={!commentText.trim()} onClick={addReviewComment} />
+                    <div className="comment-compose-side">
+                      <HTMLSelect fill value={commentField} onChange={(event) => setCommentField(event.target.value as CommentFieldKey)}>
+                        {COMMENT_FIELD_OPTIONS.map((option) => <option key={option.value} value={option.value}>关联：{option.label}</option>)}
+                      </HTMLSelect>
+                      <Button intent="primary" icon="comment" text="添加批注" disabled={!commentText.trim()} onClick={addReviewComment} />
+                    </div>
                   </div>
                   <div className="comment-list">
-                    {selectedStep.comments.map((comment) => (
-                      <article key={comment.id} className={comment.resolved ? 'resolved' : ''}>
-                        <div className="comment-avatar">{comment.author.slice(0, 1)}</div>
-                        <div><header><strong>{comment.author}</strong><span>{comment.role}</span><time>{formatDate(comment.createdAt)}</time></header><p>{comment.text}</p><Button minimal small text={comment.resolved ? '已解决' : '标记解决'} icon={comment.resolved ? 'tick' : 'circle'} onClick={() => resolveComment(comment.id)} /></div>
-                      </article>
-                    ))}
+                    {selectedStep.comments.map((comment) => {
+                      const fieldKey = comment.fieldKey ?? 'step';
+                      return (
+                        <article key={comment.id} className={comment.resolved ? 'resolved' : 'pending'}>
+                          <div className="comment-avatar">{comment.author.slice(0, 1)}</div>
+                          <div>
+                            <header>
+                              <strong>{comment.author}</strong><span>{comment.role}</span>
+                              <Tag minimal className="comment-field-tag">{commentFieldLabel(fieldKey)}</Tag>
+                              <Tag minimal intent={comment.resolved ? 'success' : 'warning'}>{comment.resolved ? '已解决' : '待处理'}</Tag>
+                              <time>{formatDate(comment.createdAt)}</time>
+                            </header>
+                            <p>{comment.text}</p>
+                            {!comment.resolved && comment.reopenedAt && (
+                              <p className="comment-change-note">
+                                <Icon icon="warning-sign" intent="warning" size={12} />
+                                {fieldKey === 'step'
+                                  ? '步骤内容在批注解决后又有变更，该意见已退回待处理。'
+                                  : `「${commentFieldLabel(fieldKey)}」在批注解决后已变更（写入时：${displayFieldValue(comment.fieldValue)}），该意见已退回待处理。`}
+                              </p>
+                            )}
+                            <Button minimal small text={comment.resolved ? '已解决' : '标记解决'} icon={comment.resolved ? 'tick' : 'circle'} onClick={() => resolveComment(comment.id)} />
+                          </div>
+                        </article>
+                      );
+                    })}
                     {!selectedStep.comments.length && <p className="muted">当前步骤尚未添加复核批注。</p>}
                   </div>
                 </Card>
@@ -667,7 +822,20 @@ function App() {
               <div className="review-progress-list">
                 {process.steps.map((step) => <div key={step.id}><span>{step.title}</span><Tag minimal intent={step.status === 'confirmed' ? 'success' : step.status === 'returned' ? 'danger' : 'warning'}>{statusLabel(step.status)}</Tag></div>)}
               </div>
-              <Button fill intent="primary" icon="lock" text="全部确认后冻结" onClick={freezeVersion} disabled={process.status === 'frozen'} />
+              {openComments.length > 0 && (
+                <div className="open-comments-box">
+                  <strong><Icon icon="comment" size={12} /> 还有 {openComments.length} 条意见未重新处理</strong>
+                  <ul>
+                    {openComments.map(({ step, comment }) => (
+                      <li key={comment.id}>
+                        <span>{step.title} · {commentFieldLabel(comment.fieldKey)}</span>
+                        <p>{comment.text}</p>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+              <Button fill intent="primary" icon="lock" text="全部确认后冻结" onClick={freezeVersion} disabled={process.status === 'frozen' || openComments.length > 0} />
             </Card>
           </aside>
         </main>
@@ -702,7 +870,20 @@ function App() {
             <div className={confirmedCount === process.steps.length ? 'passed' : ''}><Icon icon={confirmedCount === process.steps.length ? 'tick-circle' : 'circle'} /><span><strong>所有步骤已确认</strong><small>{confirmedCount}/{process.steps.length}</small></span></div>
             <div className={!missingSafetySteps.length ? 'passed' : ''}><Icon icon={!missingSafetySteps.length ? 'tick-circle' : 'circle'} /><span><strong>安全信息完整</strong><small>{missingSafetySteps.length} 个缺口</small></span></div>
             <div className={process.steps.every((step) => step.dependencies.every((id) => process.steps.some((item) => item.id === id))) ? 'passed' : ''}><Icon icon="git-merge" /><span><strong>依赖引用有效</strong><small>{process.steps.reduce((sum, step) => sum + step.dependencies.length, 0)} 条依赖</small></span></div>
-            <Button fill intent="primary" icon="lock" text="冻结当前版本" onClick={freezeVersion} disabled={process.status === 'frozen' || confirmedCount !== process.steps.length || missingSafetySteps.length > 0} />
+            <div className={!openComments.length ? 'passed' : ''}><Icon icon={!openComments.length ? 'tick-circle' : 'comment'} /><span><strong>批注全部重新处理</strong><small>{openComments.length ? `${openComments.length} 条意见未重新处理` : '无待处理批注'}</small></span></div>
+            {openComments.length > 0 && (
+              <div className="open-comments-box">
+                <ul>
+                  {openComments.map(({ step, comment }) => (
+                    <li key={comment.id}>
+                      <span>{step.title} · {commentFieldLabel(comment.fieldKey)}{comment.reopenedAt ? ' · 字段已变更' : ''}</span>
+                      <p>{comment.text}</p>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
+            <Button fill intent="primary" icon="lock" text="冻结当前版本" onClick={freezeVersion} disabled={process.status === 'frozen' || confirmedCount !== process.steps.length || missingSafetySteps.length > 0 || openComments.length > 0} />
           </Card>
         </main>
       )}
