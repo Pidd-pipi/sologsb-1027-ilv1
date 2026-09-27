@@ -151,6 +151,20 @@ button, input, textarea, select { font: inherit; }
 .freeze-rules > div strong { font-size: 10px; }
 .freeze-rules > div small { color: #8692a1; font-size: 9px; }
 .freeze-rules .bp6-button { margin-top: 14px; }
+.comment-target { min-width: 0; display: grid; gap: 8px; }
+.comment-target .bp6-html-select { width: 100%; }
+.compose-hint { margin: -6px 0 12px; }
+.recorded-value { display: block; margin: 0 0 4px; overflow: hidden; color: #7c8796; font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+.stale-hint { display: flex; align-items: center; gap: 4px; margin: 0 0 4px; color: var(--amber); font-size: 9px; font-weight: 600; }
+.pending-comments { display: grid; gap: 5px; margin: 8px 0 12px; }
+.pending-comments button { padding: 8px 9px; display: grid; grid-template-columns: 16px 1fr; gap: 6px; align-items: start; border: 1px solid #ecd9b4; border-radius: 7px; color: var(--ink); background: #fdf6ea; text-align: left; cursor: pointer; }
+.pending-comments button:hover { background: #faeed7; }
+.pending-comments strong, .pending-comments small { display: block; }
+.pending-comments strong { color: #8a5a12; font-size: 10px; }
+.pending-comments small { margin-top: 2px; overflow: hidden; color: #93763c; font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+.step-pending-callout { margin-bottom: 14px; }
+.pending-callout { margin-bottom: 10px; }
+.freeze-rules > div.pending-comments { grid-template-columns: 1fr; align-items: stretch; }
 .app-footer { min-height: 42px; padding: 13px 22px; display: flex; justify-content: space-between; gap: 20px; color: #778496; background: #e9edf2; border-top: 1px solid #d8dee5; font-size: 9px; }
 @media (max-width: 1240px) {
   .process-banner { grid-template-columns: 1fr 1fr; }

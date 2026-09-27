@@ -20,6 +20,7 @@ import {
 type StepStatus = 'draft' | 'submitted' | 'confirmed' | 'returned';
 type ProcessStatus = 'draft' | 'in-review' | 'frozen' | 'revising';
 type ViewId = 'editor' | 'review' | 'compare';
+type CommentField = 'step' | 'title' | 'purpose' | 'materials' | 'equipment' | 'amount' | 'duration' | 'hazards' | 'controls' | 'safetyNote' | 'expectedResult';
 
 interface ReviewComment {
   id: string;
@@ -28,6 +29,10 @@ interface ReviewComment {
   text: string;
   createdAt: string;
   resolved: boolean;
+  /** 批注关联的字段；旧数据缺省时按整步处理 */
+  field?: CommentField;
+  /** 批注写入（或上次标记解决）时关联字段的值，用于检测后续变更 */
+  fieldValue?: string;
 }
 
 interface ProcessStep {
@@ -88,6 +93,12 @@ interface DiffItem {
 const STORAGE_KEY = 'sologsb-1027-lab-safety-v1';
 const CURRENT_AUTHOR = '周宁';
 const CURRENT_ROLE = '安全复核员';
+const COMMENT_FIELD_LABELS: Record<CommentField, string> = {
+  step: '整步', title: '步骤名称', purpose: '操作目的', materials: '材料', equipment: '设备',
+  amount: '用量/参数', duration: '预计时间', hazards: '危险项', controls: '控制措施',
+  safetyNote: '安全说明', expectedResult: '预期结果'
+};
+const COMMENT_FIELD_OPTIONS = Object.keys(COMMENT_FIELD_LABELS) as CommentField[];
 const clone = <T,>(value: T): T => JSON.parse(JSON.stringify(value)) as T;
 
 function uid(prefix: string): string {
@@ -192,16 +203,64 @@ function historyReducer(state: HistoryState, action:
 function loadProcess(): ExperimentProcess {
   try {
     const value = localStorage.getItem(STORAGE_KEY);
-    if (!value) return initialProcess();
+    if (!value) return normalizeProcess(initialProcess());
     const parsed = JSON.parse(value) as ExperimentProcess;
-    return parsed.id && Array.isArray(parsed.steps) ? parsed : initialProcess();
+    return parsed.id && Array.isArray(parsed.steps) ? normalizeProcess(parsed) : normalizeProcess(initialProcess());
   } catch {
-    return initialProcess();
+    return normalizeProcess(initialProcess());
   }
 }
 
 function splitList(value: string): string[] {
   return value.split(/[\n,，、;；]+/).map((item) => item.trim()).filter(Boolean);
+}
+
+/** 批注关联字段当前的规范值；整步批注记录全部内容字段 */
+function fieldValueOf(step: ProcessStep, field: CommentField): string {
+  if (field === 'step') {
+    return JSON.stringify([
+      step.title, step.purpose, step.materials, step.equipment, step.amount, step.duration,
+      step.hazards, step.controls, step.safetyNote, step.expectedResult, step.dependencies
+    ]);
+  }
+  const value = step[field];
+  return Array.isArray(value) ? value.join('、') : String(value);
+}
+
+function commentFieldOf(comment: ReviewComment): CommentField {
+  return comment.field ?? 'step';
+}
+
+function isCommentStale(step: ProcessStep, comment: ReviewComment): boolean {
+  return comment.fieldValue !== undefined && comment.fieldValue !== fieldValueOf(step, commentFieldOf(comment));
+}
+
+/** 关联字段变化后，已解决的批注回到待处理，已确认步骤退回待复核 */
+function syncCommentsAfterFieldChange(step: ProcessStep): void {
+  let reopened = false;
+  step.comments.forEach((comment) => {
+    if (comment.resolved && isCommentStale(step, comment)) {
+      comment.resolved = false;
+      reopened = true;
+    }
+  });
+  if (reopened && step.status === 'confirmed') step.status = 'submitted';
+}
+
+/** 旧数据没有字段信息时按整步处理，并以载入时的值作为记录值 */
+function normalizeProcess(process: ExperimentProcess): ExperimentProcess {
+  const normalizeSteps = (steps: ProcessStep[]): void => {
+    steps.forEach((step) => {
+      step.comments = step.comments ?? [];
+      step.comments.forEach((comment) => {
+        comment.field = commentFieldOf(comment);
+        if (comment.fieldValue === undefined) comment.fieldValue = fieldValueOf(step, comment.field);
+      });
+    });
+  };
+  normalizeSteps(process.steps);
+  (process.versions ?? []).forEach((version) => normalizeSteps(version.steps ?? []));
+  return process;
 }
 
 function statusLabel(status: StepStatus): string {
@@ -226,6 +285,7 @@ function App() {
   const [activeView, setActiveView] = useState<ViewId>('editor');
   const [lastModifiedId, setLastModifiedId] = useState<string | null>(null);
   const [commentText, setCommentText] = useState('');
+  const [commentField, setCommentField] = useState<CommentField>('step');
   const [savedLabel, setSavedLabel] = useState('本地数据已载入');
   const [online, setOnline] = useState(true);
   const [compareBaseId, setCompareBaseId] = useState(process.versions[0]?.id ?? '');
@@ -239,6 +299,11 @@ function App() {
   const pendingReviewCount = process.steps.filter((step) => step.status === 'submitted' || step.status === 'returned').length;
   const confirmedCount = process.steps.filter((step) => step.status === 'confirmed').length;
   const reviewProgress = process.steps.length ? Math.round((confirmedCount / process.steps.length) * 100) : 0;
+  const pendingComments = useMemo(
+    () => process.steps.flatMap((step) => step.comments.filter((comment) => !comment.resolved).map((comment) => ({ step, comment }))),
+    [process.steps]
+  );
+  const stepPendingCount = (step: ProcessStep): number => step.comments.filter((comment) => !comment.resolved).length;
   const versionDiff = useMemo(() => compareVersions(process, compareBaseId, compareTargetId), [process, compareBaseId, compareTargetId]);
 
   useEffect(() => {
@@ -295,7 +360,9 @@ function App() {
     setLastModifiedId(id);
     commitProcess((draft) => {
       const step = draft.steps.find((item) => item.id === id);
-      if (step) (step as unknown as Record<string, unknown>)[field] = value;
+      if (!step) return;
+      (step as unknown as Record<string, unknown>)[field] = value;
+      syncCommentsAfterFieldChange(step);
     });
   };
 
@@ -325,7 +392,7 @@ function App() {
     copy.id = uid('step');
     copy.title = `${copy.title}（副本）`;
     copy.status = 'draft';
-    copy.comments = [];
+    copy.comments = copy.comments.map((comment) => ({ ...comment, id: uid('comment') }));
     copy.dependencies = [...copy.dependencies];
     commitProcess((draft) => {
       const index = draft.steps.findIndex((step) => step.id === selectedStep.id);
@@ -339,7 +406,13 @@ function App() {
     const id = selectedStep.id;
     commitProcess((draft) => {
       draft.steps = draft.steps.filter((step) => step.id !== id);
-      draft.steps.forEach((step) => { step.dependencies = step.dependencies.filter((dependency) => dependency !== id); });
+      draft.steps.forEach((step) => {
+        const nextDependencies = step.dependencies.filter((dependency) => dependency !== id);
+        if (nextDependencies.length !== step.dependencies.length) {
+          step.dependencies = nextDependencies;
+          syncCommentsAfterFieldChange(step);
+        }
+      });
     });
     setSelectedStepId(process.steps.find((step) => step.id !== id)?.id ?? '');
   };
@@ -380,11 +453,14 @@ function App() {
   const addReviewComment = (): void => {
     if (!selectedStep || !commentText.trim()) return;
     const id = selectedStep.id;
+    const field = commentField;
     commitProcess((draft) => {
       const step = draft.steps.find((item) => item.id === id);
-      step?.comments.push({
+      if (!step) return;
+      step.comments.push({
         id: uid('comment'), author: CURRENT_AUTHOR, role: CURRENT_ROLE,
-        text: commentText.trim(), createdAt: new Date().toISOString(), resolved: false
+        text: commentText.trim(), createdAt: new Date().toISOString(), resolved: false,
+        field, fieldValue: fieldValueOf(step, field)
       });
     });
     setCommentText('');
@@ -400,15 +476,20 @@ function App() {
     if (!selectedStep) return;
     const stepId = selectedStep.id;
     commitProcess((draft) => {
-      const comment = draft.steps.find((step) => step.id === stepId)?.comments.find((item) => item.id === commentId);
-      if (comment) comment.resolved = !comment.resolved;
+      const step = draft.steps.find((item) => item.id === stepId);
+      const comment = step?.comments.find((item) => item.id === commentId);
+      if (!step || !comment) return;
+      comment.resolved = !comment.resolved;
+      if (comment.resolved) comment.fieldValue = fieldValueOf(step, commentFieldOf(comment));
     });
   };
 
   const freezeVersion = (): void => {
     if (process.status === 'frozen') return;
-    if (process.steps.some((step) => step.status !== 'confirmed') || missingSafetySteps.length) {
-      setSavedLabel('冻结条件未满足');
+    if (process.steps.some((step) => step.status !== 'confirmed') || missingSafetySteps.length || pendingComments.length) {
+      setSavedLabel(pendingComments.length
+        ? `冻结条件未满足：${pendingComments.length} 条批注待重新处理（${pendingComments[0].step.title} 等）`
+        : '冻结条件未满足');
       return;
     }
     const nextNumber = nextMinorVersion(process.version);
@@ -455,6 +536,17 @@ function App() {
     });
     setSavedLabel('已保存工作版本快照');
   };
+
+  const renderPendingComments = () => (
+    <div className="pending-comments">
+      {pendingComments.map(({ step, comment }) => (
+        <button key={comment.id} type="button" onClick={() => { setSelectedStepId(step.id); setActiveView('review'); }}>
+          <Icon icon="comment" size={11} />
+          <span><strong>{step.title} · {COMMENT_FIELD_LABELS[commentFieldOf(comment)]}</strong><small>{comment.text}</small></span>
+        </button>
+      ))}
+    </div>
+  );
 
   return (
     <div className="app-shell">
@@ -513,7 +605,7 @@ function App() {
               {process.steps.map((step, index) => (
                 <button key={step.id} className={step.id === selectedStep.id ? 'selected' : ''} onClick={() => setSelectedStepId(step.id)}>
                   <span className={`step-number ${step.status}`}>{String(index + 1).padStart(2, '0')}</span>
-                  <span className="step-copy"><strong>{step.title}</strong><small>{step.duration} 分钟 · {statusLabel(step.status)}</small></span>
+                  <span className="step-copy"><strong>{step.title}</strong><small>{step.duration} 分钟 · {statusLabel(step.status)}{stepPendingCount(step) ? ` · ${stepPendingCount(step)} 条批注待处理` : ''}</small></span>
                   {hasMissingSafety(step) && <Icon icon="warning-sign" intent="danger" size={13} />}
                 </button>
               ))}
@@ -543,6 +635,11 @@ function App() {
                 <div><span>STEP {String(process.steps.indexOf(selectedStep) + 1).padStart(2, '0')}</span><h3>{selectedStep.title}</h3></div>
                 <Tag minimal intent={selectedStep.status === 'confirmed' ? 'success' : selectedStep.status === 'returned' ? 'danger' : 'warning'}>{statusLabel(selectedStep.status)}</Tag>
               </div>
+              {stepPendingCount(selectedStep) > 0 && (
+                <Callout intent="warning" icon="comment" className="step-pending-callout">
+                  该步骤有 {stepPendingCount(selectedStep)} 条批注待重新处理；关联字段被修改后，已解决的批注会自动回到待处理，已确认步骤会退回待复核。
+                </Callout>
+              )}
               <FormGroup label="步骤名称" labelFor="step-title"><InputGroup id="step-title" fill value={selectedStep.title} onChange={(event) => updateStep('title', event.target.value)} /></FormGroup>
               <FormGroup label="操作目的" labelFor="step-purpose"><TextArea id="step-purpose" fill value={selectedStep.purpose} onChange={(event) => updateStep('purpose', event.target.value)} /></FormGroup>
               <div className="form-grid">
@@ -605,8 +702,15 @@ function App() {
               <div className="card-title"><div><span>RELEASE GATE</span><h3>提交与冻结</h3></div></div>
               <div className="gate-row"><span>复核状态</span><strong>{confirmedCount}/{process.steps.length}</strong></div>
               <div className="gate-row"><span>安全缺口</span><strong className={missingSafetySteps.length ? 'danger-text' : ''}>{missingSafetySteps.length}</strong></div>
+              <div className="gate-row"><span>待处理批注</span><strong className={pendingComments.length ? 'danger-text' : ''}>{pendingComments.length}</strong></div>
               <div className="gate-row"><span>流程状态</span><strong>{processStatusLabel(process.status)}</strong></div>
               <Divider />
+              {pendingComments.length > 0 && (
+                <>
+                  <p className="muted">以下批注未重新处理，冻结前需逐条解决：</p>
+                  {renderPendingComments()}
+                </>
+              )}
               {process.status === 'frozen' ? <Button fill intent="warning" icon="git-branch" text="从冻结版创建修订" onClick={startRevision} /> : <Button fill intent="primary" icon="send-to" text="提交复核" onClick={submitForReview} />}
             </Card>
           </aside>
@@ -619,7 +723,7 @@ function App() {
             <div className="panel-heading"><div><span>REVIEW QUEUE</span><h3>逐条复核</h3></div><Tag intent={pendingReviewCount ? 'warning' : 'success'}>{pendingReviewCount ? `${pendingReviewCount} 待处理` : '已完成'}</Tag></div>
             {process.steps.map((step, index) => (
               <button key={step.id} className={`${step.id === selectedStep.id ? 'selected' : ''} ${step.status}`} onClick={() => setSelectedStepId(step.id)}>
-                <span>{String(index + 1).padStart(2, '0')}</span><div><strong>{step.title}</strong><small>{statusLabel(step.status)}</small></div><Icon icon={step.status === 'confirmed' ? 'tick-circle' : step.status === 'returned' ? 'undo' : 'circle'} size={15} />
+                <span>{String(index + 1).padStart(2, '0')}</span><div><strong>{step.title}</strong><small>{statusLabel(step.status)}{stepPendingCount(step) ? ` · ${stepPendingCount(step)} 条批注待处理` : ''}</small></div><Icon icon={step.status === 'confirmed' ? 'tick-circle' : step.status === 'returned' ? 'undo' : 'circle'} size={15} />
               </button>
             ))}
           </aside>
@@ -640,16 +744,34 @@ function App() {
                 <Card elevation={Elevation.ONE} className="comment-card">
                   <div className="card-title"><div><span>REVIEW COMMENTS</span><h3>复核批注</h3></div><Tag minimal>{selectedStep.comments.length} 条</Tag></div>
                   <div className="comment-compose">
-                    <TextArea fill value={commentText} onChange={(event) => setCommentText(event.target.value)} placeholder="填写具体依据、风险或修改建议…" />
+                    <div className="comment-target">
+                      <HTMLSelect fill aria-label="批注关联字段" value={commentField} onChange={(event) => setCommentField(event.target.value as CommentField)}>
+                        {COMMENT_FIELD_OPTIONS.map((field) => <option key={field} value={field}>关联：{COMMENT_FIELD_LABELS[field]}</option>)}
+                      </HTMLSelect>
+                      <TextArea fill value={commentText} onChange={(event) => setCommentText(event.target.value)} placeholder="填写具体依据、风险或修改建议…" />
+                    </div>
                     <Button intent="primary" icon="comment" text="添加批注" disabled={!commentText.trim()} onClick={addReviewComment} />
                   </div>
+                  <p className="muted compose-hint">批注会记录所选字段的当前值；该字段再发生变化时，批注自动回到待处理。</p>
                   <div className="comment-list">
-                    {selectedStep.comments.map((comment) => (
-                      <article key={comment.id} className={comment.resolved ? 'resolved' : ''}>
-                        <div className="comment-avatar">{comment.author.slice(0, 1)}</div>
-                        <div><header><strong>{comment.author}</strong><span>{comment.role}</span><time>{formatDate(comment.createdAt)}</time></header><p>{comment.text}</p><Button minimal small text={comment.resolved ? '已解决' : '标记解决'} icon={comment.resolved ? 'tick' : 'circle'} onClick={() => resolveComment(comment.id)} /></div>
-                      </article>
-                    ))}
+                    {selectedStep.comments.map((comment) => {
+                      const field = commentFieldOf(comment);
+                      const stale = isCommentStale(selectedStep, comment);
+                      return (
+                        <article key={comment.id} className={comment.resolved ? 'resolved' : ''}>
+                          <div className="comment-avatar">{comment.author.slice(0, 1)}</div>
+                          <div>
+                            <header><strong>{comment.author}</strong><span>{comment.role}</span><Tag minimal intent="primary">{COMMENT_FIELD_LABELS[field]}</Tag><time>{formatDate(comment.createdAt)}</time></header>
+                            <p>{comment.text}</p>
+                            {field !== 'step' && comment.fieldValue !== undefined && (
+                              <small className="recorded-value">记录时{COMMENT_FIELD_LABELS[field]}：{comment.fieldValue.trim() ? comment.fieldValue : '（空）'}</small>
+                            )}
+                            {stale && <small className="stale-hint"><Icon icon="warning-sign" size={10} /> 关联内容已变更，待重新处理</small>}
+                            <div><Button minimal small text={comment.resolved ? '已解决' : '标记解决'} icon={comment.resolved ? 'tick' : 'circle'} onClick={() => resolveComment(comment.id)} /></div>
+                          </div>
+                        </article>
+                      );
+                    })}
                     {!selectedStep.comments.length && <p className="muted">当前步骤尚未添加复核批注。</p>}
                   </div>
                 </Card>
@@ -667,6 +789,12 @@ function App() {
               <div className="review-progress-list">
                 {process.steps.map((step) => <div key={step.id}><span>{step.title}</span><Tag minimal intent={step.status === 'confirmed' ? 'success' : step.status === 'returned' ? 'danger' : 'warning'}>{statusLabel(step.status)}</Tag></div>)}
               </div>
+              {pendingComments.length > 0 && (
+                <>
+                  <Callout intent="warning" icon="comment" className="pending-callout">还有 {pendingComments.length} 条批注未重新处理，冻结前需逐条标记解决。</Callout>
+                  {renderPendingComments()}
+                </>
+              )}
               <Button fill intent="primary" icon="lock" text="全部确认后冻结" onClick={freezeVersion} disabled={process.status === 'frozen'} />
             </Card>
           </aside>
@@ -702,7 +830,9 @@ function App() {
             <div className={confirmedCount === process.steps.length ? 'passed' : ''}><Icon icon={confirmedCount === process.steps.length ? 'tick-circle' : 'circle'} /><span><strong>所有步骤已确认</strong><small>{confirmedCount}/{process.steps.length}</small></span></div>
             <div className={!missingSafetySteps.length ? 'passed' : ''}><Icon icon={!missingSafetySteps.length ? 'tick-circle' : 'circle'} /><span><strong>安全信息完整</strong><small>{missingSafetySteps.length} 个缺口</small></span></div>
             <div className={process.steps.every((step) => step.dependencies.every((id) => process.steps.some((item) => item.id === id))) ? 'passed' : ''}><Icon icon="git-merge" /><span><strong>依赖引用有效</strong><small>{process.steps.reduce((sum, step) => sum + step.dependencies.length, 0)} 条依赖</small></span></div>
-            <Button fill intent="primary" icon="lock" text="冻结当前版本" onClick={freezeVersion} disabled={process.status === 'frozen' || confirmedCount !== process.steps.length || missingSafetySteps.length > 0} />
+            <div className={!pendingComments.length ? 'passed' : ''}><Icon icon={!pendingComments.length ? 'tick-circle' : 'comment'} /><span><strong>批注全部重新处理</strong><small>{pendingComments.length ? `${pendingComments.length} 条待处理` : '无待处理批注'}</small></span></div>
+            {pendingComments.length > 0 && renderPendingComments()}
+            <Button fill intent="primary" icon="lock" text="冻结当前版本" onClick={freezeVersion} disabled={process.status === 'frozen' || confirmedCount !== process.steps.length || missingSafetySteps.length > 0 || pendingComments.length > 0} />
           </Card>
         </main>
       )}
